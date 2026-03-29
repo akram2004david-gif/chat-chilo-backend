@@ -25,14 +25,20 @@ const io = new Server(server, {
     },
     pingTimeout: 60000,
     pingInterval: 25000,
-    transports: ['websocket', 'polling']
+    transports: ['websocket', 'polling'],
+    maxHttpBufferSize: 1e6 // 1MB max message size
 });
 
 // Queue and pairs
 let waitingQueue = [];
 let activePairs = {};
 
-// Keep-alive mechanism to prevent Render from spinning down
+// Memory management
+const MAX_MEMORY_USAGE = 400 * 1024 * 1024; // 400MB limit
+const CLEANUP_INTERVAL = 5 * 60 * 1000; // Cleanup every 5 minutes
+const MEMORY_CHECK_INTERVAL = 2 * 60 * 1000; // Check memory every 2 minutes
+
+// Keep-alive mechanism
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL || 'https://chat-chilo-backend.onrender.com';
 
 function keepAlive() {
@@ -47,19 +53,117 @@ function keepAlive() {
     });
 }
 
-// Ping every 10 minutes (before Render's 15 minute timeout)
+// Ping every 10 minutes
 setInterval(() => {
     keepAlive();
 }, 10 * 60 * 1000);
 
-// Also ping on startup
-setTimeout(() => {
-    keepAlive();
-}, 5 * 60 * 1000);
+// Memory cleanup function
+function cleanupMemory() {
+    console.log('🧹 Starting memory cleanup...');
+    
+    // Clean disconnected sockets from active pairs
+    let cleanedPairs = 0;
+    for (const [socketId, partnerId] of Object.entries(activePairs)) {
+        const socket = io.sockets.sockets.get(socketId);
+        const partner = io.sockets.sockets.get(partnerId);
+        
+        if (!socket || !partner || !socket.connected || !partner.connected) {
+            delete activePairs[socketId];
+            delete activePairs[partnerId];
+            cleanedPairs++;
+            console.log(`🗑️ Cleaned inactive pair: ${socketId} - ${partnerId}`);
+        }
+    }
+    
+    // Clean disconnected sockets from queue
+    const initialQueueLength = waitingQueue.length;
+    waitingQueue = waitingQueue.filter(socket => {
+        return socket && socket.connected;
+    });
+    
+    const cleanedQueue = initialQueueLength - waitingQueue.length;
+    console.log(`🗑️ Cleaned ${cleanedQueue} disconnected sockets from queue`);
+    
+    // Force garbage collection if available
+    if (global.gc) {
+        console.log('♻️ Forcing garbage collection...');
+        global.gc();
+    }
+    
+    const memoryUsage = process.memoryUsage();
+    console.log('📊 Memory after cleanup:', {
+        heapUsed: (memoryUsage.heapUsed / 1024 / 1024).toFixed(2) + ' MB',
+        heapTotal: (memoryUsage.heapTotal / 1024 / 1024).toFixed(2) + ' MB',
+        external: (memoryUsage.external / 1024 / 1024).toFixed(2) + ' MB'
+    });
+    
+    console.log(`✅ Cleanup complete. Removed ${cleanedPairs} pairs and ${cleanedQueue} queue items`);
+}
+
+// Memory check function
+function checkMemory() {
+    const memoryUsage = process.memoryUsage();
+    const heapUsed = memoryUsage.heapUsed;
+    
+    console.log('📊 Current memory usage:', {
+        heapUsed: (heapUsed / 1024 / 1024).toFixed(2) + ' MB',
+        heapTotal: (memoryUsage.heapTotal / 1024 / 1024).toFixed(2) + ' MB',
+        rss: (memoryUsage.rss / 1024 / 1024).toFixed(2) + ' MB'
+    });
+    
+    if (heapUsed > MAX_MEMORY_USAGE) {
+        console.warn('⚠️ High memory usage detected! Triggering cleanup...');
+        cleanupMemory();
+        
+        // If still high after cleanup, restart
+        setTimeout(() => {
+            const newUsage = process.memoryUsage();
+            if (newUsage.heapUsed > MAX_MEMORY_USAGE) {
+                console.error('🚨 Critical memory usage! Initiating graceful restart...');
+                gracefulRestart();
+            }
+        }, 5000);
+    }
+}
+
+// Graceful restart function
+function gracefulRestart() {
+    console.log('🔄 Initiating graceful restart...');
+    
+    // Notify all connected users
+    io.emit('server_restart', {
+        message: 'Server is restarting for maintenance. Please reconnect in a few seconds.'
+    });
+    
+    // Close server after 5 seconds
+    setTimeout(() => {
+        server.close(() => {
+            console.log('✅ Server closed. Process will be restarted by Render...');
+            process.exit(0);
+        });
+        
+        // Force exit after 10 seconds
+        setTimeout(() => {
+            console.log('⚠️ Forcing process exit...');
+            process.exit(1);
+        }, 10000);
+    }, 5000);
+}
+
+// Schedule regular cleanup
+setInterval(cleanupMemory, CLEANUP_INTERVAL);
+
+// Schedule memory checks
+setInterval(checkMemory, MEMORY_CHECK_INTERVAL);
+
+// Initial cleanup after 1 minute
+setTimeout(cleanupMemory, 60 * 1000);
 
 // Socket.IO connection handler
 io.on('connection', (socket) => {
     console.log('✅ User connected:', socket.id);
+    console.log('📊 Active connections:', io.engine.clientsCount);
 
     // Handle start_chat event
     socket.on('start_chat', () => {
@@ -78,6 +182,7 @@ io.on('connection', (socket) => {
                 partner.emit('matched', { partnerId: socket.id });
                 
                 console.log(`🔗 Matched: ${socket.id} ↔ ${partner.id}`);
+                console.log('📊 Active pairs:', Object.keys(activePairs).length / 2);
             } else {
                 // Partner not available, add back to queue
                 waitingQueue.push(socket);
@@ -88,6 +193,7 @@ io.on('connection', (socket) => {
             waitingQueue.push(socket);
             socket.emit('waiting');
             console.log('⏳ User in queue:', socket.id);
+            console.log('📊 Queue length:', waitingQueue.length);
         }
     });
 
@@ -99,7 +205,6 @@ io.on('connection', (socket) => {
                 text: data.text,
                 from: socket.id 
             });
-            console.log(`💬 Message from ${socket.id} to ${partnerId}: ${data.text}`);
         }
     });
 
@@ -120,12 +225,19 @@ io.on('connection', (socket) => {
     });
 
     // Handle disconnect
-    socket.on('disconnect', () => {
-        console.log('❌ User disconnected:', socket.id);
+    socket.on('disconnect', (reason) => {
+        console.log('❌ User disconnected:', socket.id, 'Reason:', reason);
         endPair(socket.id);
         
         // Remove from queue
+        const initialLength = waitingQueue.length;
         waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
+        
+        if (waitingQueue.length < initialLength) {
+            console.log('🗑️ Removed from queue. New length:', waitingQueue.length);
+        }
+        
+        console.log('📊 Active connections:', io.engine.clientsCount);
     });
 
     // Helper function to end pair
@@ -144,11 +256,19 @@ io.on('connection', (socket) => {
 
 // Health check endpoint
 app.get('/', (req, res) => {
+    const memoryUsage = process.memoryUsage();
     res.json({ 
         status: 'Server is running',
         timestamp: new Date().toISOString(),
         connectedUsers: io.engine.clientsCount,
-        uptime: process.uptime()
+        waitingUsers: waitingQueue.length,
+        activePairs: Object.keys(activePairs).length / 2,
+        uptime: process.uptime(),
+        memory: {
+            heapUsed: (memoryUsage.heapUsed / 1024 / 1024).toFixed(2) + ' MB',
+            heapTotal: (memoryUsage.heapTotal / 1024 / 1024).toFixed(2) + ' MB',
+            rss: (memoryUsage.rss / 1024 / 1024).toFixed(2) + ' MB'
+        }
     });
 });
 
@@ -163,13 +283,31 @@ app.get('/health', (req, res) => {
 
 // Stats endpoint
 app.get('/stats', (req, res) => {
+    const memoryUsage = process.memoryUsage();
     res.json({
         totalUsers: io.engine.clientsCount,
         waitingUsers: waitingQueue.length,
         activePairs: Object.keys(activePairs).length / 2,
         uptime: process.uptime(),
-        memory: process.memoryUsage()
+        memory: {
+            heapUsed: (memoryUsage.heapUsed / 1024 / 1024).toFixed(2) + ' MB',
+            heapTotal: (memoryUsage.heapTotal / 1024 / 1024).toFixed(2) + ' MB',
+            external: (memoryUsage.external / 1024 / 1024).toFixed(2) + ' MB',
+            rss: (memoryUsage.rss / 1024 / 1024).toFixed(2) + ' MB'
+        },
+        config: {
+            maxMemory: (MAX_MEMORY_USAGE / 1024 / 1024) + ' MB',
+            cleanupInterval: CLEANUP_INTERVAL / 1000 + ' seconds',
+            memoryCheckInterval: MEMORY_CHECK_INTERVAL / 1000 + ' seconds'
+        }
     });
+});
+
+// Manual cleanup endpoint (for debugging)
+app.post('/cleanup', (req, res) => {
+    console.log('🧹 Manual cleanup triggered via API');
+    cleanupMemory();
+    res.json({ message: 'Cleanup triggered' });
 });
 
 // Start server
@@ -181,6 +319,9 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log('🌍 Environment:', process.env.NODE_ENV || 'development');
     console.log('🔗 Server URL:', SERVER_URL);
     console.log('⏰ Keep-alive enabled - will ping every 10 minutes');
+    console.log('🧹 Auto-cleanup enabled - every', CLEANUP_INTERVAL / 1000 / 60, 'minutes');
+    console.log('📊 Memory check enabled - every', MEMORY_CHECK_INTERVAL / 1000 / 60, 'minutes');
+    console.log('⚠️ Max memory limit:', MAX_MEMORY_USAGE / 1024 / 1024, 'MB');
 });
 
 // Handle server errors
@@ -192,10 +333,22 @@ server.on('error', (error) => {
 // Handle graceful shutdown
 process.on('SIGTERM', () => {
     console.log('👋 SIGTERM received, shutting down gracefully');
+    
+    // Notify all users
+    io.emit('server_shutdown', {
+        message: 'Server is shutting down for maintenance. Please reconnect shortly.'
+    });
+    
     server.close(() => {
         console.log('✅ Server closed');
         process.exit(0);
     });
+    
+    // Force close after 10 seconds
+    setTimeout(() => {
+        console.log('⚠️ Forcing shutdown...');
+        process.exit(1);
+    }, 10000);
 });
 
 process.on('SIGINT', () => {
@@ -214,7 +367,18 @@ process.on('unhandledRejection', (reason, promise) => {
 // Log uncaught exceptions
 process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
+    // Try to cleanup before exit
+    cleanupMemory();
     process.exit(1);
 });
 
+// Handle memory warnings
+process.on('warning', (warning) => {
+    console.warn('⚠️ Process warning:', warning);
+    if (warning.name === 'MemoryWarning') {
+        cleanupMemory();
+    }
+});
+
 console.log('✅ Server initialized successfully');
+console.log('🛡️ Memory management enabled');
