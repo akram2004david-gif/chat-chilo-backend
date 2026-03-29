@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const { Server } = require('socket.io');
 const cors = require('cors');
 
@@ -30,6 +31,31 @@ const io = new Server(server, {
 // Queue and pairs
 let waitingQueue = [];
 let activePairs = {};
+
+// Keep-alive mechanism to prevent Render from spinning down
+const SERVER_URL = process.env.RENDER_EXTERNAL_URL || 'https://chat-chilo-backend.onrender.com';
+
+function keepAlive() {
+    console.log('🔔 Sending keep-alive ping...');
+    
+    const protocol = SERVER_URL.startsWith('https') ? https : http;
+    
+    protocol.get(SERVER_URL + '/health', (res) => {
+        console.log('✅ Keep-alive ping successful:', res.statusCode);
+    }).on('error', (err) => {
+        console.log('⚠️ Keep-alive ping error:', err.message);
+    });
+}
+
+// Ping every 10 minutes (before Render's 15 minute timeout)
+setInterval(() => {
+    keepAlive();
+}, 10 * 60 * 1000);
+
+// Also ping on startup
+setTimeout(() => {
+    keepAlive();
+}, 5 * 60 * 1000);
 
 // Socket.IO connection handler
 io.on('connection', (socket) => {
@@ -73,6 +99,7 @@ io.on('connection', (socket) => {
                 text: data.text,
                 from: socket.id 
             });
+            console.log(`💬 Message from ${socket.id} to ${partnerId}: ${data.text}`);
         }
     });
 
@@ -120,22 +147,40 @@ app.get('/', (req, res) => {
     res.json({ 
         status: 'Server is running',
         timestamp: new Date().toISOString(),
-        connectedUsers: io.engine.clientsCount
+        connectedUsers: io.engine.clientsCount,
+        uptime: process.uptime()
     });
 });
 
-// Health check for Render
+// Health check for Render and UptimeRobot
 app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'OK' });
+    res.status(200).json({ 
+        status: 'OK',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
+});
+
+// Stats endpoint
+app.get('/stats', (req, res) => {
+    res.json({
+        totalUsers: io.engine.clientsCount,
+        waitingUsers: waitingQueue.length,
+        activePairs: Object.keys(activePairs).length / 2,
+        uptime: process.uptime(),
+        memory: process.memoryUsage()
+    });
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📡 WebSocket server ready`);
-    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log('🚀 Server running on port', PORT);
+    console.log('📡 WebSocket server ready');
+    console.log('🌍 Environment:', process.env.NODE_ENV || 'development');
+    console.log('🔗 Server URL:', SERVER_URL);
+    console.log('⏰ Keep-alive enabled - will ping every 10 minutes');
 });
 
 // Handle server errors
@@ -160,3 +205,16 @@ process.on('SIGINT', () => {
         process.exit(0);
     });
 });
+
+// Log unhandled rejections
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Log uncaught exceptions
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    process.exit(1);
+});
+
+console.log('✅ Server initialized successfully');
